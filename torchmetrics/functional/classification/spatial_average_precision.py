@@ -1,8 +1,10 @@
 
-from typing import Tuple
+from typing import Tuple, Optional
+from collections import defaultdict
 
 import torch
 from torch import Tensor
+from torch import LongTensor
 
 from torchmetrics.functional.classification.average_precision import (
     _average_precision_update,
@@ -32,7 +34,10 @@ def bin_mask_iou(pred_masks: Tensor, target_masks: Tensor) -> Tensor:
         A tensor with all pairwise IOUs, will have shape [p, t] if no classes
         are present in the input tensors or [c,p,t] if classes are.
     """
-    # Should I assert that the input is actually 0-1 ??
+    assert (torch.max(pred_masks) <= 1) and (torch.min(pred_masks) >= 0)
+    assert (torch.max(target_masks) <= 1) and (torch.min(target_masks) >= 0)
+        
+
     intersections = torch.einsum("p...ij, t...ij -> ...pt", pred_masks, target_masks)
     except_1 = torch.einsum("p...ij, t...ij -> ...pt", 1 - pred_masks, target_masks)
     except_2 = torch.einsum("p...ij, t...ij -> ...pt", pred_masks, 1 - target_masks)
@@ -139,6 +144,26 @@ def _get_mappings(iou_mat: Tensor) -> Tensor:
 
 
 def _map_predictions(ious: Tensor) -> Tuple[Tensor, Tensor]:
+    """
+    Assigns the best matching intersections
+
+    Provided a matrix of intersection over-unions, returns tensors of targets and
+    predictions, assigning each original prediction to maximum a single target,
+    each target to a single prediction and setting the extra predictions as
+    false positives and setting targets that do not intersect as false negatives.
+
+    Parameters
+    ----------
+    ious : Tensor
+        A matrix of IoU scores, more specifically of shape [NUM_PREDS, NUM_TARGETS]
+
+    Returns
+    -------
+    Tuple[Tensor, Tensor]
+        A vector of predictions and a vector of targets, being the targets 1 or -1.
+        The prediction vector contains the IoU scores of matching elements, -Inf for
+        false negatives and Inf for false positives.
+    """
     mappings = _get_mappings(ious)
 
     tps_map = mappings.max(axis = 0)
@@ -159,36 +184,136 @@ def _map_predictions(ious: Tensor) -> Tuple[Tensor, Tensor]:
     return preds_out, target_out
 
 
-def _binary_mask_average_precision_update(
-    preds: Tensor,
-    target: Tensor,
-) -> Tuple[Tensor, Tensor, int, int]:
-    ious = bin_mask_iou(pred_masks=preds, target_masks=target)
-    preds_in, target_in = _map_predictions(ious)
+def _binary_spatial_average_precision_update_builder(iou_function, updating_function):
+    def bin_update_function(
+        preds: Tensor,
+        target: Tensor,
+    ) -> Tuple[Tensor, Tensor, int, int]:
 
-    return _average_precision_update(preds_in, target_in, pos_label = 1)
+        # TODO handle case where there are no predictions and no targets
+        if any([x == 0 for x in preds.shape]):
+            # If there are no predictions, everything is a false negative
+            preds_in = torch.tensor(-float('inf'))
+            target_in = torch.tensor(1).long()
+        elif any([x == 0 for x in target.shape]):
+            # If there are no targets everything is a false positive
+            preds_in = torch.tensor(float('inf'))
+            target_in = torch.tensor(0).long()
+        else:
+            ious = iou_function(pred_masks=preds, target_masks=target)
+            preds_in, target_in = _map_predictions(ious)
 
-
-def _binary_mask_average_precision_compute(*args, **kwargs) -> Tensor:
-    # masks are converted by _binary_mask_average_precision_update to preds and
-    # targets that are compatible with the standard avg_precision_compute
-    return _average_precision_compute(*args, **kwargs)
-
-
-def _binary_box_average_precision_update(
-    preds: Tensor,
-    targets: Tensor,
-) -> Tuple[Tensor, Tensor, int, int]:
-    ious = box_iou(preds, targets)
-    preds_in, target_in = _map_predictions(ious)
-
-    return _average_precision_update(preds_in, target_in, pos_label = 1)
+        return updating_function(preds_in, target_in, pos_label = 1)
+    return bin_update_function
 
 
-def _binary_box_average_precision_compute(*args, **kwargs):
-    # boxes are converted by _binary_box_average_precision_update to preds and
-    # targets that are compatible with the standard avg_precision_compute
-    return _average_precision_compute(*args, **kwargs)
+_binary_mask_average_precision_update = _binary_spatial_average_precision_update_builder(
+    bin_mask_iou,
+    _average_precision_update
+)
+
+_binary_box_average_precision_update = _binary_spatial_average_precision_update_builder(
+    box_iou,
+    _average_precision_update,
+)
+
+_binary_mask_average_precision_compute = _average_precision_compute
+# masks are converted by _binary_mask_average_precision_update to preds and
+# targets that are compatible with the standard avg_precision_compute
+
+_binary_box_average_precision_compute = _average_precision_compute
+# boxes are converted by _binary_box_average_precision_update to preds and
+# targets that are compatible with the standard avg_precision_compute
+
+
+def _spatial_average_precision_update_builder(update_function):
+    def avg_prec_fun(
+        preds: Tensor,
+        target: Tensor,
+        pred_classes: Optional[LongTensor] = None,
+        target_classes: Optional[LongTensor] = None,
+        pred_grouping: Optional[LongTensor] = None,
+        target_grouping: Optional[LongTensor] = None,
+        num_classes:int = None,
+    ) -> Tuple[dict, dict]:
+        if pred_grouping is None and target_grouping is None:
+            pred_grouping = torch.ones(len(preds)).long()
+            target_grouping = torch.ones(len(target)).long()
+
+        if target_classes is None and pred_classes is None:
+            target_classes = torch.ones(len(target)).long()
+            pred_classes = torch.ones(len(preds)).long()
+
+        uniq_classes = torch.unique(torch.cat([
+            torch.unique(pred_classes),
+            torch.unique(target_classes)]))
+        uniq_groups = torch.unique(torch.cat([
+            torch.unique(pred_grouping),
+            torch.unique(target_grouping)
+        ]))
+
+        assert len(uniq_groups) == len(set([str(int(x)) for x in uniq_groups]))
+        assert len(uniq_classes) == len(set([str(int(x)) for x in uniq_classes]))
+        if num_classes is not None:
+            assert len(uniq_classes) <= num_classes
+        else:
+            num_classes = len(uniq_classes)
+
+        res = defaultdict(lambda: list())
+        for group in uniq_groups:
+            for cls in uniq_classes:
+                tmp_preds = preds[(pred_classes == cls ) & (pred_grouping == group)]
+                tmp_target = target[(target_classes == cls) & (target_grouping == group)]
+
+                outs = update_function(tmp_preds, tmp_target)
+                res[str(int(group))].append(outs)
+        
+        output_preds = {
+            k:torch.cat([y[0] for y in x])
+            for k,x in res.items()
+        }
+        output_target = {
+            k:torch.cat([y[1] for y in x])
+            for k,x in res.items()
+        }
+        return output_preds, output_target
+    return avg_prec_fun
+
+
+def _spatial_average_precision_compute_builder(compute_function):
+    def update_fun(input_preds, input_target, num_classes):
+        out_precision = [
+            compute_function(
+                preds = x,
+                target = y,
+                num_classes = 1,
+                pos_label = 1,
+            ) for x, y in zip(input_preds.values(), input_target.values())]
+
+        if num_classes is not None:
+            assert len(out_precision) <= num_classes
+        else:
+            num_classes = len(out_precision)   
+
+        return torch.tensor(out_precision).sum() / num_classes
+    return update_fun
+
+
+_box_average_precision_compute = _spatial_average_precision_compute_builder(
+    _binary_box_average_precision_compute
+)
+
+_mask_average_precision_compute = _spatial_average_precision_compute_builder(
+    _binary_mask_average_precision_compute
+)
+
+_box_average_precision_update = _spatial_average_precision_update_builder(
+    _binary_box_average_precision_update
+)
+
+_mask_average_precision_update = _spatial_average_precision_update_builder(
+    _binary_mask_average_precision_update
+)
 
 
 def binary_box_average_precision(
@@ -250,6 +375,48 @@ def binary_mask_average_precision(
     return _binary_mask_average_precision_compute(preds, target, num_classes, pos_label, sample_weights = None)
 
 
+def box_average_precision(  
+    preds,
+    target,
+    pred_classes = None,
+    target_classes = None,
+    pred_grouping = None,
+    target_grouping = None,
+    num_classes = None,
+):
+    out_preds, out_target = _box_average_precision_update(
+        preds = preds, 
+        target = target,
+        pred_classes = pred_classes,
+        target_classes = target_classes,
+        pred_grouping = pred_grouping,
+        target_grouping = target_grouping,
+        num_classes = num_classes)
+
+    return _box_average_precision_compute(out_preds, out_target, num_classes=num_classes)
+
+
+def mask_average_precision(  
+    preds,
+    target,
+    pred_classes = None,
+    target_classes = None,
+    pred_grouping = None,
+    target_grouping = None,
+    num_classes = None,
+):
+    out_preds, out_target = _mask_average_precision_update(
+        preds = preds, 
+        target = target,
+        pred_classes = pred_classes,
+        target_classes = target_classes,
+        pred_grouping = pred_grouping,
+        target_grouping = target_grouping,
+        num_classes = num_classes)
+
+    return _mask_average_precision_compute(out_preds, out_target, num_classes=num_classes)
+
+
 def test_binary_mask_iou_works():
     square = torch.zeros([1, 5, 5])
     square[..., 1:, 1:] = 1
@@ -287,7 +454,21 @@ def test_binary_mask_iou_works():
     assert out.shape == torch.Size([4, 2, 2])
 
 
-def test_bin_box_mAP():
+def test_box_AP_works():
+    pred_boxes = [
+        [0, 0, 100, 100],
+        [100,100,150,150],
+        [300,300,450,450],
+        [200,200,250,250],
+    ]
+    target_boxes = [
+        [10, 10, 110, 110],
+        [110,110,150,150],
+        [1000, 1000, 1100, 1100],
+    ]
+
+
+def test_bin_box_AP():
     pred_boxes = [
         [0, 0, 100, 100],
         [100,100,150,150],
@@ -351,3 +532,62 @@ def test_bin_mask_mAP():
     outs = binary_mask_average_precision(preds, targets)
     assert torch.all(outs - 1 < 1e-5)
     assert len(outs.flatten()) == 1
+
+
+def test_box_average_precision():
+    preds = torch.randint(0, 2000, [40, 4])
+    preds[...,2:] = preds[...,2:] + torch.randint(0, 500, [40, 2])
+
+    target = torch.randint(0, 2000, [20, 4])
+    target[...,2:] = target[...,2:] + torch.randint(0, 500, [20, 2])
+
+    outs = box_average_precision(preds, target)
+
+    pred_classes = torch.randint(0, 5, [40])
+    target_classes = torch.randint(0, 5, [20])
+
+    outs = box_average_precision(
+        preds,
+        target,
+        pred_classes=pred_classes,
+        target_classes=target_classes)
+
+    # Test that it works when not all classes are provided in the predictions
+    pred_classes = torch.randint(0, 3, [40])
+    target_classes = torch.randint(0, 5, [20])
+
+    outs = box_average_precision(
+        preds,
+        target,
+        pred_classes=pred_classes,
+        target_classes=target_classes)
+
+    return outs
+
+
+def test_mask_average_precision():
+    preds = torch.randint(0, 2, [40, 224, 224])
+    target = torch.randint(0, 2, [20, 224, 224])
+
+    outs = mask_average_precision(preds, target)
+
+    pred_classes = torch.randint(0, 5, [40])
+    target_classes = torch.randint(0, 5, [20])
+
+    outs = mask_average_precision(
+        preds,
+        target,
+        pred_classes=pred_classes,
+        target_classes=target_classes)
+
+    # Test that it works when not all classes are provided in the predictions
+    pred_classes = torch.randint(0, 3, [40])
+    target_classes = torch.randint(0, 5, [20])
+
+    outs = mask_average_precision(
+        preds,
+        target,
+        pred_classes=pred_classes,
+        target_classes=target_classes)
+
+    return outs
