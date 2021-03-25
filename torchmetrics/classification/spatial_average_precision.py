@@ -14,9 +14,11 @@ from torchmetrics.functional.classification.spatial_average_precision import (
 )
 
 
-class BoxAveragePrecision(Metric):
+class SpatialAveragePrecision(Metric):
     def __init__(
         self,
+        update_fun,
+        compute_fun,
         num_classes: Optional[int] = None,
         compute_on_step: bool = True,
         dist_sync_on_step: bool = False,
@@ -29,15 +31,8 @@ class BoxAveragePrecision(Metric):
         )
 
         self.num_classes = num_classes
-        self.add_state(
-            "preds",
-            default = defaultdict(lambda: list()),
-            dist_reduce_fx=self.reduce_pred_dicts)
-
-        self.add_state(
-            "target",
-            default = defaultdict(lambda: list()),
-            dist_reduce_fx=self.reduce_pred_dicts)
+        self.update_fun = update_fun
+        self.compute_fun = compute_fun
 
     def update(
         self,
@@ -48,12 +43,7 @@ class BoxAveragePrecision(Metric):
         pred_grouping: Optional[LongTensor] = None,
         target_grouping: Optional[LongTensor] = None,
     ):
-        # (preds: float = [N1,C] , targets: long/bool = [N2,C] , pred_boxes = [x,x,y,y], target_boxes = [x,x,y,y], pred_grouping: long = [N1], target_grouping: long = [N2], iou_cutoff = 0.5)
-        # Logic to match the boxes
-        if pred_grouping is not None or target_grouping is not None:
-            raise NotImplementedError
-
-        output_preds, output_target = _box_average_precision_update(
+        output_preds, output_target = self.update_fun(
             preds = preds,
             target = target,
             pred_classes = pred_classes,
@@ -62,43 +52,142 @@ class BoxAveragePrecision(Metric):
             target_grouping = target_grouping,
             num_classes = self.num_classes,
         )
+        self.append_states(output_preds, output_target)
 
-        for k,v in output_preds.items():
-            self.preds[k].append(v)
+    def append_states(self, preds, target):
+        for k,v in preds.items():
+            attr_name = f'preds_{k}'
+            if not hasattr(self, attr_name):
+                self.add_state(
+                    attr_name,
+                    default = [],
+                    dist_reduce_fx = None)
 
-        for k,v in output_target.items():
-            self.target[k].append(v)
+            getattr(self, attr_name).append(v)
+
+        for k,v in target.items():
+            attr_name = f'target_{k}'
+            if not hasattr(self, attr_name):
+                self.add_state(
+                    attr_name,
+                    default = [],
+                    dist_reduce_fx = None)
+
+            getattr(self, attr_name).append(v)
         
     def compute(self):
-        preds = {k:torch.cat(x) for k,x in self.preds.items()}
-        target = {k:torch.cat(x) for k,x in self.target.items()}
+        pred_attrs = [x for x in dir(self) if 'preds' in x]
+        target_attrs = [x for x in dir(self) if 'target' in x]
 
-        return _box_average_precision_compute(preds, target, self.num_classes)
+        preds = {k.replace('preds_', ''):torch.cat(getattr(self, k)) for k in pred_attrs}
+        target = {k.replace('target_', ''):torch.cat(getattr(self, k)) for k in target_attrs}
 
-    @staticmethod
-    def combine_pred_dict(target_dict, append_dict):
-        target_dict = copy.deepcopy(target_dict)
+        return self.compute_fun(preds, target, self.num_classes)
 
-        for k,v in append_dict.items():
-            target_dict[k].append(v)
 
-        return target_dict
+class BoxAveragePrecision(SpatialAveragePrecision):
+    def __init__(
+        self,
+        num_classes: Optional[int] = None,
+        compute_on_step: bool = True,
+        dist_sync_on_step: bool = False,
+        process_group: Optional[Any] = None,
+    ):
+        super().__init__(
+            compute_on_step=compute_on_step,
+            dist_sync_on_step=dist_sync_on_step,
+            process_group=process_group,
+            num_classes=num_classes,
+            update_fun = _box_average_precision_update,
+            compute_fun = _box_average_precision_compute,
+        )
 
-    @staticmethod
-    def reduce_pred_dicts(lst):
-        return reduce(BoxAveragePrecision.combine_pred_dict, lst)
 
+    def update(
+        self,
+        preds: LongTensor,
+        target: LongTensor,
+        pred_classes: Optional[LongTensor] = None,
+        target_classes: Optional[LongTensor] = None,
+        pred_grouping: Optional[LongTensor] = None,
+        target_grouping: Optional[LongTensor] = None,
+    ):
+        super().update(
+            preds,
+            target,
+            pred_classes,
+            target_classes,
+            pred_grouping,
+            target_grouping)
+        
+    def compute(self):
+        return super().compute()
+
+
+class MaskAveragePrecision(SpatialAveragePrecision):
+    def __init__(
+        self,
+        num_classes: Optional[int] = None,
+        compute_on_step: bool = True,
+        dist_sync_on_step: bool = False,
+        process_group: Optional[Any] = None,
+    ):
+        super().__init__(
+            compute_on_step=compute_on_step,
+            dist_sync_on_step=dist_sync_on_step,
+            process_group=process_group,
+            num_classes=num_classes,
+            update_fun = _mask_average_precision_update,
+            compute_fun = _mask_average_precision_compute,
+        )
+
+
+    def update(
+        self,
+        preds: LongTensor,
+        target: LongTensor,
+        pred_classes: Optional[LongTensor] = None,
+        target_classes: Optional[LongTensor] = None,
+        pred_grouping: Optional[LongTensor] = None,
+        target_grouping: Optional[LongTensor] = None,
+    ):
+        super().update(
+            preds,
+            target,
+            pred_classes,
+            target_classes,
+            pred_grouping,
+            target_grouping)
+        
+    def compute(self):
+        return super().compute()
+
+# TODO:
+# - Implement AP at threshold
 
 preds = torch.randint(0, 2000, [40, 4])
-preds[...,2:] = preds[...,2:] + torch.randint(0, 500, [40, 2])
+preds[...,2:] = preds[...,:2] + torch.randint(100, 500, [40, 2])
 
 target = torch.randint(0, 2000, [20, 4])
-target[...,2:] = target[...,2:] + torch.randint(0, 500, [20, 2])
+target[...,2:] = target[...,:2] + torch.randint(100, 500, [20, 2])
 
 bap = BoxAveragePrecision()
 bap.update(preds, target)
+bap.update(preds, target)
+bap.update(preds, target)
 
+print(bap.compute())
 
+map = MaskAveragePrecision()
+
+preds = torch.randint(0, 2, [40, 224, 224])
+target = torch.randint(0, 2, [20, 224, 224])
+
+map.update(preds, target)
+map.update(preds, target)
+map.update(preds, target)
+
+print(map.compute())
 
 """
 
@@ -122,7 +211,6 @@ class MaskAveragePrecisionAtThreshold():
 
     def compute(self, preds, target):
         raise NotImplementedError
-
 
 def BinMaskMAP(
     preds: Tensor,

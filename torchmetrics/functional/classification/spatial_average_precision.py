@@ -200,7 +200,7 @@ def _binary_spatial_average_precision_update_builder(iou_function, updating_func
             preds_in = torch.tensor(float('inf'))
             target_in = torch.tensor(0).long()
         else:
-            ious = iou_function(pred_masks=preds, target_masks=target)
+            ious = iou_function(preds, target)
             preds_in, target_in = _map_predictions(ious)
 
         return updating_function(preds_in, target_in, pos_label = 1)
